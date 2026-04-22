@@ -352,11 +352,41 @@ describe('new API surface', () => {
         width: 1024,
         height: 1024,
         quality: 80,
+        exifOrientation: 'preserve',
       })
     );
 
     expect(readJpegOrientation(new Uint8Array(result.data))).toBe(6);
     expect(result.stats.notes).toContain('jpeg-orientation=6');
+    expect(result.stats.notes).toContain('jpeg-exif-policy=preserve');
+  });
+
+  it('applies jpeg exif orientation to pixels when autorotate is enabled', async () => {
+    const oriented = injectOrientation(largeJpeg, 6);
+    const baseline = await collect(
+      transform(toArrayBuffer(largeJpeg), {
+        width: 1024,
+        height: 1024,
+        quality: 80,
+        exifOrientation: 'preserve',
+      })
+    );
+
+    const result = await collect(
+      transform(toArrayBuffer(oriented), {
+        width: 1024,
+        height: 1024,
+        quality: 80,
+        exifOrientation: 'autorotate',
+      })
+    );
+
+    expect(result.info.width).toBe(baseline.info.height);
+    expect(result.info.height).toBe(baseline.info.width);
+    expect(readJpegOrientation(new Uint8Array(result.data))).toBeNull();
+    expect(result.stats.notes).toContain('jpeg-orientation=6');
+    expect(result.stats.notes).toContain('jpeg-exif-policy=autorotate');
+    expect(result.stats.notes.some((note) => note.startsWith('jpeg-orientation-buffered='))).toBe(true);
   });
 
   it('transforms PNG, WebP, and AVIF samples to JPEG', async () => {

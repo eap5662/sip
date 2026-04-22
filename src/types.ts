@@ -30,10 +30,13 @@ export type ByteInput =
   | ReadableStream<Uint8Array>
   | AsyncIterable<Uint8Array>;
 
+export type ExifOrientationPolicy = 'preserve' | 'autorotate';
+
 export interface TransformOptions {
   width?: number;
   height?: number;
   quality?: number;
+  exifOrientation?: ExifOrientationPolicy;
 }
 
 /**

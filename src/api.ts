@@ -1,5 +1,11 @@
 import { createDecoder } from './decoders/simple';
 import { asArrayBuffer, collectSourceBytes, inspect, inspectSource, prepareInputSource } from './input';
+import {
+  applyExifOrientationToRgb,
+  getExifOrientedDimensions,
+  isExifOrientation,
+  type ExifOrientation,
+} from './orientation';
 import { probe } from './probe';
 import {
   calculateTargetDimensions,
@@ -15,6 +21,7 @@ import type {
   InputSource,
   PixelStream,
   Scanline,
+  ExifOrientationPolicy,
   TransformOptions,
   TransformStats,
 } from './types';
@@ -244,6 +251,10 @@ async function readJpegOrientationFromSource(source: {
 
   const extended = await source.ensureHeaderBytes(262_144);
   return readJpegOrientation(extended);
+}
+
+function resolveExifOrientationPolicy(options: TransformOptions): ExifOrientationPolicy {
+  return options.exifOrientation === 'autorotate' ? 'autorotate' : 'preserve';
 }
 
 class StatsTracker {
@@ -586,6 +597,217 @@ export function encodeJpeg(stream: PixelStream, options: TransformOptions = {}):
   return createEncodedImage(iteratorFactory, infoPromise, statsPromise);
 }
 
+async function decodeJpegIntoResizedBuffer(
+  source: PreparedSource,
+  info: ImageInfo,
+  target: { width: number; height: number },
+  scale: 1 | 2 | 4 | 8,
+  stats: StatsTracker
+): Promise<{
+  pixels: Uint8Array;
+  decodeWidth: number;
+  decodeHeight: number;
+}> {
+  const decoder = new WasmJpegDecoder();
+  let resizeState = createResizeState(1, 1, target.width, target.height);
+  let decodeWidth = info.width;
+  let decodeHeight = info.height;
+  const pixels = new Uint8Array(target.width * target.height * 3);
+  let rowsWritten = 0;
+  let headerReady = false;
+  let started = false;
+
+  const copyResizedScanline = (scanline: Scanline) => {
+    const offset = scanline.y * target.width * 3;
+    if (offset < 0 || offset + scanline.data.byteLength > pixels.byteLength) {
+      throw new Error(`Resize scanline out of bounds at y=${scanline.y}`);
+    }
+
+    pixels.set(scanline.data, offset);
+    rowsWritten++;
+  };
+
+  const refresh = () => {
+    const resizeBytes =
+      (resizeState.bufferA?.byteLength ?? 0) +
+      (resizeState.bufferB?.byteLength ?? 0);
+    const codecBytes =
+      decoder.getBufferedInputSize() +
+      decoder.getRowBufferSize();
+    const pipelineBytes = codecBytes + resizeBytes + pixels.byteLength;
+    stats.update(decoder.getBufferedInputSize(), 0, codecBytes, pipelineBytes);
+  };
+
+  try {
+    if (source.kind === 'bytes') {
+      const bytes = await collectSourceBytes(source);
+      stats.addBytesIn(bytes.byteLength);
+      refresh();
+
+      decoder.init(asArrayBuffer(bytes));
+      const output = decoder.setScale(scale);
+      decodeWidth = output.width;
+      decodeHeight = output.height;
+      resizeState = createResizeState(output.width, output.height, target.width, target.height);
+      decoder.start();
+      headerReady = true;
+      started = true;
+      refresh();
+
+      while (true) {
+        const scanline = decoder.readScanline();
+        if (!scanline) {
+          break;
+        }
+
+        for (const outScanline of processScanline(resizeState, scanline.data, scanline.y)) {
+          copyResizedScanline(outScanline);
+        }
+        refresh();
+      }
+    } else {
+      for await (const { chunk, isFinal } of iterateInputChunks(source)) {
+        stats.addBytesIn(chunk.byteLength);
+        decoder.pushInput(chunk, isFinal);
+        refresh();
+
+        if (!headerReady) {
+          const headerStep = decoder.readHeaderStep();
+          if (headerStep === 'needMore') {
+            continue;
+          }
+
+          headerReady = true;
+          const output = decoder.setScale(scale);
+          decodeWidth = output.width;
+          decodeHeight = output.height;
+          resizeState = createResizeState(output.width, output.height, target.width, target.height);
+          refresh();
+        }
+
+        if (!started) {
+          const startStep = decoder.startStep();
+          if (startStep === 'needMore') {
+            continue;
+          }
+
+          started = true;
+          refresh();
+        }
+
+        while (true) {
+          const scanline = decoder.readScanlineStep();
+          if (scanline === 'needMore' || scanline === null) {
+            break;
+          }
+
+          for (const outScanline of processScanline(resizeState, scanline.data, scanline.y)) {
+            copyResizedScanline(outScanline);
+          }
+          refresh();
+        }
+      }
+    }
+
+    if (decoder.finishStep() !== 'ready') {
+      throw new Error('Unexpected end of JPEG input while finishing');
+    }
+
+    for (const outScanline of flushResize(resizeState)) {
+      copyResizedScanline(outScanline);
+    }
+    refresh();
+  } finally {
+    decoder.dispose();
+  }
+
+  if (rowsWritten !== target.height) {
+    throw new Error(`Unexpected resized JPEG row count: wrote ${rowsWritten} expected ${target.height}`);
+  }
+
+  return {
+    pixels,
+    decodeWidth,
+    decodeHeight,
+  };
+}
+
+async function* runJpegAutorotateTransform(
+  source: PreparedSource,
+  info: ImageInfo,
+  options: TransformOptions,
+  infoDeferred: InfoResolver<EncodedImageInfo>,
+  stats: StatsTracker,
+  orientation: ExifOrientation
+): AsyncIterable<Uint8Array> {
+  const target = normalizeBox(options, info.width, info.height);
+  const scale = calculateOptimalScale(info.width, info.height, target.width, target.height);
+  const { pixels: resizedPixels, decodeWidth, decodeHeight } = await decodeJpegIntoResizedBuffer(
+    source,
+    info,
+    target,
+    scale,
+    stats
+  );
+
+  stats.note(`jpeg-dct-scale=1/${scale}`);
+  stats.note(`jpeg-decoded=${decodeWidth}x${decodeHeight}`);
+
+  const expectedOutput = getExifOrientedDimensions(target.width, target.height, orientation);
+  const oriented = applyExifOrientationToRgb(resizedPixels, target.width, target.height, orientation);
+  const orientationBytes = resizedPixels.byteLength + oriented.data.byteLength;
+  stats.note(`jpeg-orientation-buffered=${orientationBytes}`);
+
+  if (oriented.width !== expectedOutput.width || oriented.height !== expectedOutput.height) {
+    throw new Error(
+      `Unexpected orientation output dimensions ${oriented.width}x${oriented.height} ` +
+      `for orientation=${orientation}`
+    );
+  }
+
+  infoDeferred.resolve({
+    width: oriented.width,
+    height: oriented.height,
+    mimeType: 'image/jpeg',
+    originalFormat: 'jpeg',
+  });
+
+  const encoder = new WasmJpegEncoder();
+
+  const refresh = () => {
+    const codecBytes = encoder.getBufferedOutputSize() + encoder.getRowBufferSize();
+    const pipelineBytes = codecBytes + oriented.data.byteLength;
+    stats.update(0, encoder.getBufferedOutputSize(), codecBytes, pipelineBytes);
+  };
+
+  try {
+    encoder.init(oriented.width, oriented.height, options.quality ?? DEFAULT_QUALITY);
+    encoder.start();
+    refresh();
+
+    const rowStride = oriented.width * 3;
+    for (let y = 0; y < oriented.height; y++) {
+      const rowStart = y * rowStride;
+      const rowEnd = rowStart + rowStride;
+      encoder.writeScanlineData(oriented.data.subarray(rowStart, rowEnd));
+      refresh();
+      for (const chunk of encoder.drainChunks()) {
+        stats.addBytesOut(chunk.byteLength);
+        refresh();
+        yield chunk;
+      }
+    }
+
+    for (const chunk of encoder.finish()) {
+      stats.addBytesOut(chunk.byteLength);
+      refresh();
+      yield chunk;
+    }
+  } finally {
+    encoder.dispose();
+  }
+}
+
 async function* runJpegTransform(
   source: PreparedSource,
   info: ImageInfo,
@@ -595,7 +817,25 @@ async function* runJpegTransform(
 ): AsyncIterable<Uint8Array> {
   await loadWasm();
 
-  const orientation = await readJpegOrientationFromSource(source);
+  const orientationPolicy = resolveExifOrientationPolicy(options);
+  stats.note(`jpeg-exif-policy=${orientationPolicy}`);
+
+  const orientationRaw = await readJpegOrientationFromSource(source);
+  const orientation = isExifOrientation(orientationRaw) ? orientationRaw : null;
+  if (orientation !== null) {
+    stats.note(`jpeg-orientation=${orientation}`);
+  }
+
+  if (
+    orientationPolicy === 'autorotate' &&
+    orientation !== null &&
+    orientation >= 2 &&
+    orientation <= 8
+  ) {
+    yield* runJpegAutorotateTransform(source, info, options, infoDeferred, stats, orientation);
+    return;
+  }
+
   const orientationSegment = orientation ? buildExifOrientationSegment(orientation) : null;
   const target = normalizeBox(options, info.width, info.height);
   const decoder = new WasmJpegDecoder();
@@ -626,10 +866,6 @@ async function* runJpegTransform(
       const bytes = await collectSourceBytes(source);
       stats.addBytesIn(bytes.byteLength);
       refresh();
-
-      if (orientationSegment) {
-        stats.note(`jpeg-orientation=${orientation}`);
-      }
 
       decoder.init(asArrayBuffer(bytes));
       const output = decoder.setScale(scale);
@@ -704,10 +940,6 @@ async function* runJpegTransform(
       }
 
       return;
-    }
-
-    if (orientationSegment) {
-      stats.note(`jpeg-orientation=${orientation}`);
     }
 
     for await (const { chunk, isFinal } of iterateInputChunks(source)) {
