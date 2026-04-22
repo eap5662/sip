@@ -31,12 +31,16 @@ export type ByteInput =
   | AsyncIterable<Uint8Array>;
 
 export type ExifOrientationPolicy = 'preserve' | 'autorotate';
+export type AlphaPolicy =
+  | { mode: 'discard' }
+  | { mode: 'flatten'; background: [number, number, number] };
 
 export interface TransformOptions {
   width?: number;
   height?: number;
   quality?: number;
   exifOrientation?: ExifOrientationPolicy;
+  alpha?: AlphaPolicy;
 }
 
 /**

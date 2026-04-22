@@ -1095,12 +1095,18 @@ void sip_decoder_destroy(SipDecoder* dec) {
 
 typedef struct {
     spng_ctx *ctx;
+    uint8_t *decode_row_buffer;
     uint8_t *row_buffer;
     uint32_t width;
     uint32_t height;
     uint8_t bit_depth;
     uint8_t color_type;
     uint8_t has_alpha;
+    uint8_t flatten_alpha;
+    uint8_t bg_r;
+    uint8_t bg_g;
+    uint8_t bg_b;
+    uint32_t decode_row_stride;
     uint32_t row_stride;
     uint32_t current_row;
     int initialized;
@@ -1201,27 +1207,49 @@ int sip_png_decoder_has_alpha(SipPngDecoder* dec) {
 
 /**
  * Start PNG decoding (progressive row-by-row mode)
- * Output format is always RGB (3 bytes per pixel)
+ * Output row buffer is always RGB (3 bytes per pixel).
+ * If flatten_alpha is enabled and source has alpha, decode rows as RGBA and
+ * composite each pixel onto the provided background color.
  */
 EMSCRIPTEN_KEEPALIVE
-int sip_png_decoder_start(SipPngDecoder* dec) {
+int sip_png_decoder_start(
+    SipPngDecoder* dec,
+    int flatten_alpha,
+    uint8_t bg_r,
+    uint8_t bg_g,
+    uint8_t bg_b
+) {
     if (!dec || !dec->initialized) return -1;
 
-    // We decode to RGB format (SPNG_FMT_RGB8)
-    int ret = spng_decode_image(dec->ctx, NULL, 0, SPNG_FMT_RGB8, SPNG_DECODE_PROGRESSIVE);
+    dec->flatten_alpha = (dec->has_alpha && flatten_alpha) ? 1 : 0;
+    dec->bg_r = bg_r;
+    dec->bg_g = bg_g;
+    dec->bg_b = bg_b;
+
+    int fmt = dec->flatten_alpha ? SPNG_FMT_RGBA8 : SPNG_FMT_RGB8;
+    int ret = spng_decode_image(dec->ctx, NULL, 0, fmt, SPNG_DECODE_PROGRESSIVE);
     if (ret != 0 && ret != SPNG_EOI) {
         snprintf(last_error, sizeof(last_error), "spng_decode_image init failed: %d", ret);
         return -1;
     }
 
-    // Calculate row stride (RGB = 3 bytes per pixel)
     dec->row_stride = dec->width * 3;
+    dec->decode_row_stride = dec->flatten_alpha ? (dec->width * 4) : dec->row_stride;
 
-    // Allocate row buffer
     dec->row_buffer = (uint8_t*)malloc(dec->row_stride);
     if (!dec->row_buffer) {
         snprintf(last_error, sizeof(last_error), "Failed to allocate row buffer");
         return -1;
+    }
+
+    if (dec->flatten_alpha) {
+        dec->decode_row_buffer = (uint8_t*)malloc(dec->decode_row_stride);
+        if (!dec->decode_row_buffer) {
+            free(dec->row_buffer);
+            dec->row_buffer = NULL;
+            snprintf(last_error, sizeof(last_error), "Failed to allocate PNG decode row buffer");
+            return -1;
+        }
     }
 
     dec->current_row = 0;
@@ -1258,10 +1286,38 @@ int sip_png_decoder_read_row(SipPngDecoder* dec) {
         return -1;
     }
 
-    ret = spng_decode_row(dec->ctx, dec->row_buffer, dec->row_stride);
+    uint8_t *decode_target = dec->flatten_alpha ? dec->decode_row_buffer : dec->row_buffer;
+    uint32_t decode_stride = dec->flatten_alpha ? dec->decode_row_stride : dec->row_stride;
+    ret = spng_decode_row(dec->ctx, decode_target, decode_stride);
     if (ret != 0 && ret != SPNG_EOI) {
         snprintf(last_error, sizeof(last_error), "spng_decode_row failed: %d", ret);
         return -1;
+    }
+
+    if (dec->flatten_alpha) {
+        for (uint32_t x = 0; x < dec->width; x++) {
+            uint8_t *rgba = &dec->decode_row_buffer[x * 4];
+            uint8_t *rgb = &dec->row_buffer[x * 3];
+            uint8_t a = rgba[3];
+
+            if (a == 255) {
+                rgb[0] = rgba[0];
+                rgb[1] = rgba[1];
+                rgb[2] = rgba[2];
+                continue;
+            }
+
+            if (a == 0) {
+                rgb[0] = dec->bg_r;
+                rgb[1] = dec->bg_g;
+                rgb[2] = dec->bg_b;
+                continue;
+            }
+
+            rgb[0] = (uint8_t)((rgba[0] * a + dec->bg_r * (255 - a) + 127) / 255);
+            rgb[1] = (uint8_t)((rgba[1] * a + dec->bg_g * (255 - a) + 127) / 255);
+            rgb[2] = (uint8_t)((rgba[2] * a + dec->bg_b * (255 - a) + 127) / 255);
+        }
     }
 
     dec->current_row++;
@@ -1290,11 +1346,17 @@ EMSCRIPTEN_KEEPALIVE
 int sip_png_decoder_finish(SipPngDecoder* dec) {
     if (!dec) return -1;
 
+    if (dec->decode_row_buffer) {
+        free(dec->decode_row_buffer);
+        dec->decode_row_buffer = NULL;
+    }
+
     if (dec->row_buffer) {
         free(dec->row_buffer);
         dec->row_buffer = NULL;
     }
 
+    dec->flatten_alpha = 0;
     dec->decoding = 0;
     return 0;
 }

@@ -54,7 +54,13 @@ export interface SipWasmModule {
   _sip_png_decoder_get_width(dec: number): number;
   _sip_png_decoder_get_height(dec: number): number;
   _sip_png_decoder_has_alpha(dec: number): number;
-  _sip_png_decoder_start(dec: number): number;
+  _sip_png_decoder_start(
+    dec: number,
+    flattenAlpha: number,
+    bgR: number,
+    bgG: number,
+    bgB: number
+  ): number;
   _sip_png_decoder_get_row_buffer(dec: number): number;
   _sip_png_decoder_read_row(dec: number): number;
   _sip_png_decoder_get_row(dec: number): number;

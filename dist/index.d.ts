@@ -20,11 +20,18 @@ type ProbeResult = ImageInfo;
  */
 type ByteInput = ArrayBuffer | Uint8Array | Blob | Request | Response | ReadableStream<Uint8Array> | AsyncIterable<Uint8Array>;
 type ExifOrientationPolicy = 'preserve' | 'autorotate';
+type AlphaPolicy = {
+    mode: 'discard';
+} | {
+    mode: 'flatten';
+    background: [number, number, number];
+};
 interface TransformOptions {
     width?: number;
     height?: number;
     quality?: number;
     exifOrientation?: ExifOrientationPolicy;
+    alpha?: AlphaPolicy;
 }
 /**
  * Internal/publicly returned reusable source after inspect().
@@ -173,4 +180,4 @@ declare function collect(image: EncodedImage): Promise<{
 declare function toReadableStream(image: EncodedImage): ReadableStream<Uint8Array>;
 declare function toResponse(image: EncodedImage, init?: ResponseInit): Response;
 
-export { type ByteInput, type DecoderState, type EncodedImage, type EncodedImageInfo, type EncoderState, type ExifOrientationPolicy, type ImageFormat, type ImageInfo, type InputSource, type InspectResult, type PixelStream, type ProbeResult, type ProcessOptions, type ProcessResult, type ResizeState, type Scanline, type TransformOptions, type TransformStats, collect, decode, encodeJpeg, inspect, ready, resize, toReadableStream, toResponse, transform };
+export { type AlphaPolicy, type ByteInput, type DecoderState, type EncodedImage, type EncodedImageInfo, type EncoderState, type ExifOrientationPolicy, type ImageFormat, type ImageInfo, type InputSource, type InspectResult, type PixelStream, type ProbeResult, type ProcessOptions, type ProcessResult, type ResizeState, type Scanline, type TransformOptions, type TransformStats, collect, decode, encodeJpeg, inspect, ready, resize, toReadableStream, toResponse, transform };

@@ -5,9 +5,13 @@
  * Decodes one row at a time to minimize memory usage.
  */
 
-import type { Scanline } from '../types';
+import type { AlphaPolicy, Scanline } from '../types';
 import type { SipWasmModule } from './types';
 import { getWasmModule, copyToWasm } from './loader';
+
+type PngDecoderStartOptions = {
+  alpha?: AlphaPolicy;
+};
 
 /**
  * WASM-based PNG decoder with row-by-row decoding
@@ -83,7 +87,7 @@ export class WasmPngDecoder {
   /**
    * Start decoding
    */
-  start(): void {
+  start(options: PngDecoderStartOptions = {}): void {
     if (!this.decoder) {
       throw new Error('Decoder not initialized');
     }
@@ -91,7 +95,16 @@ export class WasmPngDecoder {
       throw new Error('Decoding already started');
     }
 
-    if (this.module._sip_png_decoder_start(this.decoder) !== 0) {
+    const alpha = normalizeAlphaPolicy(options.alpha);
+    if (
+      this.module._sip_png_decoder_start(
+        this.decoder,
+        alpha.mode === 'flatten' ? 1 : 0,
+        alpha.background[0],
+        alpha.background[1],
+        alpha.background[2]
+      ) !== 0
+    ) {
       throw new Error('Failed to start PNG decompression');
     }
 
@@ -203,4 +216,34 @@ export class WasmPngDecoder {
     this.rowBufferPtr = 0;
     this.currentRow = 0;
   }
+}
+
+function normalizeAlphaPolicy(input: AlphaPolicy | undefined): {
+  mode: 'discard' | 'flatten';
+  background: [number, number, number];
+} {
+  if (!input) {
+    return { mode: 'discard', background: [255, 255, 255] };
+  }
+
+  if (input.mode === 'flatten') {
+    return {
+      mode: 'flatten',
+      background: [
+        clampByte(input.background[0]),
+        clampByte(input.background[1]),
+        clampByte(input.background[2]),
+      ],
+    };
+  }
+
+  return { mode: 'discard', background: [255, 255, 255] };
+}
+
+function clampByte(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 255;
+  }
+
+  return Math.max(0, Math.min(255, Math.trunc(value)));
 }

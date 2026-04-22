@@ -1062,7 +1062,13 @@ async function* runBufferedTransform(
   if (info.format === 'png') {
     const decoder = new WasmPngDecoder();
     decoder.init(asArrayBuffer(bytes));
-    decoder.start();
+    const alphaPolicy = resolvePngAlphaPolicy(options.alpha);
+    decoder.start({ alpha: alphaPolicy });
+    stats.note(
+      alphaPolicy.mode === 'flatten'
+        ? `png-alpha=flatten:${alphaPolicy.background.join(',')}`
+        : 'png-alpha=discard'
+    );
 
     const state = createResizeState(info.width, info.height, target.width, target.height);
     scanlines = (async function* pngRows() {
@@ -1130,6 +1136,33 @@ async function* runBufferedTransform(
   } finally {
     encoder.dispose();
   }
+}
+
+function resolvePngAlphaPolicy(
+  alpha: TransformOptions['alpha']
+): { mode: 'discard' } | { mode: 'flatten'; background: [number, number, number] } {
+  if (!alpha || alpha.mode !== 'flatten') {
+    return { mode: 'discard' };
+  }
+
+  const background: [number, number, number] = [
+    clampColor(alpha.background[0]),
+    clampColor(alpha.background[1]),
+    clampColor(alpha.background[2]),
+  ];
+
+  return {
+    mode: 'flatten',
+    background,
+  };
+}
+
+function clampColor(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 255;
+  }
+
+  return Math.max(0, Math.min(255, Math.trunc(value)));
 }
 
 export function transform(input: ByteInput | InputSource, options: TransformOptions = {}): EncodedImage {

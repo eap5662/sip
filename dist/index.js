@@ -1158,14 +1158,21 @@ var WasmPngDecoder = class {
   /**
    * Start decoding
    */
-  start() {
+  start(options = {}) {
     if (!this.decoder) {
       throw new Error("Decoder not initialized");
     }
     if (this.started) {
       throw new Error("Decoding already started");
     }
-    if (this.module._sip_png_decoder_start(this.decoder) !== 0) {
+    const alpha = normalizeAlphaPolicy(options.alpha);
+    if (this.module._sip_png_decoder_start(
+      this.decoder,
+      alpha.mode === "flatten" ? 1 : 0,
+      alpha.background[0],
+      alpha.background[1],
+      alpha.background[2]
+    ) !== 0) {
       throw new Error("Failed to start PNG decompression");
     }
     this.rowBufferPtr = this.module._sip_png_decoder_get_row_buffer(this.decoder);
@@ -1258,6 +1265,28 @@ var WasmPngDecoder = class {
     this.currentRow = 0;
   }
 };
+function normalizeAlphaPolicy(input) {
+  if (!input) {
+    return { mode: "discard", background: [255, 255, 255] };
+  }
+  if (input.mode === "flatten") {
+    return {
+      mode: "flatten",
+      background: [
+        clampByte(input.background[0]),
+        clampByte(input.background[1]),
+        clampByte(input.background[2])
+      ]
+    };
+  }
+  return { mode: "discard", background: [255, 255, 255] };
+}
+function clampByte(value) {
+  if (!Number.isFinite(value)) {
+    return 255;
+  }
+  return Math.max(0, Math.min(255, Math.trunc(value)));
+}
 
 // src/api.ts
 var DEFAULT_QUALITY = 85;
@@ -2060,7 +2089,11 @@ async function* runBufferedTransform(source, info, options, infoDeferred, stats)
   if (info.format === "png") {
     const decoder = new WasmPngDecoder();
     decoder.init(asArrayBuffer(bytes));
-    decoder.start();
+    const alphaPolicy = resolvePngAlphaPolicy(options.alpha);
+    decoder.start({ alpha: alphaPolicy });
+    stats.note(
+      alphaPolicy.mode === "flatten" ? `png-alpha=flatten:${alphaPolicy.background.join(",")}` : "png-alpha=discard"
+    );
     const state = createResizeState(info.width, info.height, target.width, target.height);
     scanlines = (async function* pngRows() {
       try {
@@ -2120,6 +2153,26 @@ async function* runBufferedTransform(source, info, options, infoDeferred, stats)
   } finally {
     encoder.dispose();
   }
+}
+function resolvePngAlphaPolicy(alpha) {
+  if (!alpha || alpha.mode !== "flatten") {
+    return { mode: "discard" };
+  }
+  const background = [
+    clampColor(alpha.background[0]),
+    clampColor(alpha.background[1]),
+    clampColor(alpha.background[2])
+  ];
+  return {
+    mode: "flatten",
+    background
+  };
+}
+function clampColor(value) {
+  if (!Number.isFinite(value)) {
+    return 255;
+  }
+  return Math.max(0, Math.min(255, Math.trunc(value)));
 }
 function transform(input, options = {}) {
   const infoDeferred = createDeferred();
